@@ -3,17 +3,20 @@ package main
 import (
 	"crypto/rand"
 	"encoding/base64"
-	"flag"
+	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/juju/gnuflag"
 	"github.com/shadowsocks/go-shadowsocks2/core"
 )
 
@@ -22,6 +25,11 @@ var config struct {
 	UDPTimeout time.Duration
 }
 
+var (
+	isVpn   bool
+	fakeDns *FakeDns
+)
+
 func logf(f string, v ...interface{}) {
 	if config.Verbose {
 		log.Printf(f, v...)
@@ -29,6 +37,7 @@ func logf(f string, v ...interface{}) {
 }
 
 func main() {
+	runtime.GOMAXPROCS(1)
 
 	var flags struct {
 		Client    string
@@ -44,30 +53,45 @@ func main() {
 		UDPTun    string
 	}
 
+	flag := gnuflag.NewFlagSet(os.Args[0], gnuflag.ContinueOnError)
+
+	var bindAddr string
+	var bindPort int
+	var confPath string
+	flag.BoolVar(&isVpn, "V", false, "vpn mode")
+	flag.StringVar(&bindAddr, "b", "", "client bind address")
+	flag.IntVar(&bindPort, "l", 0, "client bind port")
+	flag.StringVar(&confPath, "c", "", "conf path")
+	flag.Bool("u", true, "udp")
+	flag.Bool("fast-open", false, "fast-open")
+	flag.Int("t", 0, "timeout")
+	flag.String("acl", "", "acl")
+
 	flag.BoolVar(&config.Verbose, "verbose", false, "verbose mode")
 	flag.StringVar(&flags.Cipher, "cipher", "AEAD_CHACHA20_POLY1305", "available ciphers: "+strings.Join(core.ListCipher(), " "))
 	flag.StringVar(&flags.Key, "key", "", "base64url-encoded key (derive from password if empty)")
 	flag.IntVar(&flags.Keygen, "keygen", 0, "generate a base64url-encoded random key of given length in byte")
 	flag.StringVar(&flags.Password, "password", "", "password")
 	flag.StringVar(&flags.Server, "s", "", "server listen address or url")
-	flag.StringVar(&flags.Client, "c", "", "client connect address or url")
 	flag.StringVar(&flags.Socks, "socks", "", "(client-only) SOCKS listen address")
 	flag.StringVar(&flags.RedirTCP, "redir", "", "(client-only) redirect TCP from this address")
 	flag.StringVar(&flags.RedirTCP6, "redir6", "", "(client-only) redirect TCP IPv6 from this address")
 	flag.StringVar(&flags.TCPTun, "tcptun", "", "(client-only) TCP tunnel (laddr1=raddr1,laddr2=raddr2,...)")
 	flag.StringVar(&flags.UDPTun, "udptun", "", "(client-only) UDP tunnel (laddr1=raddr1,laddr2=raddr2,...)")
 	flag.DurationVar(&config.UDPTimeout, "udptimeout", 5*time.Minute, "UDP tunnel timeout")
-	flag.Parse()
+	flag.Parse(false, os.Args[1:])
+
+	if isVpn {
+		os.Chdir("/data/data/com.github.shadowsocks/files")
+		f, _ := os.OpenFile("sslocal.stdout", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+		log.SetOutput(f)
+		log.Println("now in vpn mode")
+	}
 
 	if flags.Keygen > 0 {
 		key := make([]byte, flags.Keygen)
 		io.ReadFull(rand.Reader, key)
 		fmt.Println(base64.URLEncoding.EncodeToString(key))
-		return
-	}
-
-	if flags.Client == "" && flags.Server == "" {
-		flag.Usage()
 		return
 	}
 
@@ -78,6 +102,36 @@ func main() {
 			log.Fatal(err)
 		}
 		key = k
+	}
+
+	if bindAddr != "" && bindPort > 0 {
+		flags.Socks = fmt.Sprintf("%s:%d", bindAddr, bindPort)
+	}
+	if confPath != "" {
+		type jsonConf struct {
+			Server   string `json:"server"`
+			Port     int    `json:"server_port"`
+			Password string `json:"password"`
+			Method   string `json:"method"`
+		}
+		b, err := ioutil.ReadFile(confPath)
+		if err != nil {
+			log.Fatalf("read %s: %v", confPath, err)
+		}
+		var c jsonConf
+		if err := json.Unmarshal(b, &c); err != nil {
+			log.Fatalf("parse json conf: %v", err)
+		}
+		ssUrl := url.URL{
+			Scheme: "ss",
+			User:   url.UserPassword(c.Method, c.Password),
+			Host:   fmt.Sprintf("%s:%d", c.Server, c.Port),
+		}
+		flags.Client = ssUrl.String()
+		if isVpn {
+			fakeDns = NewFakeDns(bindPort + 53)
+			go fakeDns.Start()
+		}
 	}
 
 	if flags.Client != "" { // client mode
@@ -123,6 +177,11 @@ func main() {
 		if flags.RedirTCP6 != "" {
 			go redir6Local(flags.RedirTCP6, addr, ciph.StreamConn)
 		}
+	}
+
+	if flags.Client == "" && flags.Server == "" {
+		flag.Usage()
+		return
 	}
 
 	if flags.Server != "" { // server mode

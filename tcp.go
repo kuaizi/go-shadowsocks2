@@ -49,6 +49,9 @@ func tcpLocal(addr, server string, shadow func(net.Conn) net.Conn, getAddr func(
 				logf("failed to get target address: %v", err)
 				return
 			}
+			if fakeDns != nil {
+				tgt = fakeDns.Replace(tgt)
+			}
 
 			rc, err := net.Dial("tcp", server)
 			if err != nil {
